@@ -4,3 +4,4 @@ joblib
 shap
 scikit-learn
 xgboost
+gunicorn
