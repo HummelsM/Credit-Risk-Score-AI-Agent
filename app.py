@@ -10,11 +10,9 @@ import shap
 
 pipeline = joblib.load("credit_risk_pipeline.pkl")
 
-# Extract XGBoost model and preprocessing component
 model = pipeline.named_steps["model"]
 preprocessor = pipeline.named_steps["preprocessor"]
 
-# SHAP explainer for the XGBoost model
 explainer = shap.TreeExplainer(model)
 
 
@@ -54,6 +52,25 @@ REQUIRED_FIELDS = [
 
 
 # ============================================================
+# Root endpoint
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def home():
+
+    return jsonify({
+        "service": "Credit Risk Assessment API",
+        "status": "running",
+        "available_endpoints": [
+            "/",
+            "/health",
+            "/debug",
+            "/api/assess-credit"
+        ]
+    })
+
+
+# ============================================================
 # Feature engineering
 # ============================================================
 
@@ -61,18 +78,15 @@ def engineer_features(applicant):
 
     applicant = applicant.copy()
 
-    # Monthly credit burden
     applicant["Monthly_Burden"] = (
-        applicant["Credit_Amount"] /
-        applicant["Duration"]
+        applicant["Credit_Amount"]
+        / applicant["Duration"]
     )
 
-    # Whether applicant has multiple existing credits
     applicant["Multiple_Credits"] = (
         applicant["Existing_Credits"] > 1
     ).astype(int)
 
-    # Age group
     applicant["Age_Group"] = pd.cut(
         applicant["Age"],
         bins=[18, 30, 45, 60, 100],
@@ -94,29 +108,22 @@ def engineer_features(applicant):
 
 def get_shap_explanation(applicant):
 
-    # Apply the same preprocessing used during training
     X_processed = preprocessor.transform(applicant)
 
-    # Calculate SHAP values
     shap_values = explainer.shap_values(X_processed)
 
-    # XGBoost binary classification normally gives
-    # one SHAP value per transformed feature.
     if isinstance(shap_values, list):
         shap_values = shap_values[0]
 
     shap_values = shap_values[0]
 
-    # Get names after OneHotEncoding
     feature_names = preprocessor.get_feature_names_out()
 
-    # Create a dataframe containing feature names and SHAP values
     shap_df = pd.DataFrame({
         "feature": feature_names,
         "shap_value": shap_values
     })
 
-    # Sort by absolute contribution
     shap_df["absolute_shap"] = (
         shap_df["shap_value"].abs()
     )
@@ -126,28 +133,49 @@ def get_shap_explanation(applicant):
         ascending=False
     )
 
-    # Return top five factors
     top_features = shap_df.head(5)
 
     explanations = []
 
     for _, row in top_features.iterrows():
 
-        feature = row["feature"]
-        value = float(row["shap_value"])
-
-        if value > 0:
-            direction = "increased"
-        else:
-            direction = "decreased"
+        direction = (
+            "increased"
+            if row["shap_value"] > 0
+            else "decreased"
+        )
 
         explanations.append({
-            "feature": feature,
-            "impact": round(abs(value), 4),
+            "feature": row["feature"],
+            "impact": round(
+                abs(float(row["shap_value"])),
+                4
+            ),
             "direction": direction
         })
 
     return explanations
+
+
+# ============================================================
+# Debug endpoint
+# ============================================================
+
+@app.route("/debug", methods=["POST"])
+def debug():
+
+    data = request.get_json(silent=True)
+
+    return jsonify({
+        "success": True,
+        "received_data": data,
+        "received_fields": (
+            list(data.keys())
+            if isinstance(data, dict)
+            else []
+        ),
+        "content_type": request.content_type
+    })
 
 
 # ============================================================
@@ -160,19 +188,31 @@ def assess_credit():
     try:
 
         # ----------------------------------------------------
-        # Get JSON request
+        # Receive JSON
         # ----------------------------------------------------
 
-        data = request.get_json()
+        data = request.get_json(silent=True)
+
+        print("=" * 60)
+        print("REQUEST RECEIVED")
+        print("=" * 60)
+        print("Headers:")
+        print(dict(request.headers))
+        print("-" * 60)
+        print("JSON Data:")
+        print(data)
+        print("=" * 60)
 
         if not data:
+
             return jsonify({
-                "error": "No JSON data received."
+                "error": "No JSON data received.",
+                "content_type": request.content_type
             }), 400
 
 
         # ----------------------------------------------------
-        # Check required fields
+        # Validate required fields
         # ----------------------------------------------------
 
         missing_fields = [
@@ -185,12 +225,14 @@ def assess_credit():
 
             return jsonify({
                 "error": "Missing required fields.",
-                "missing_fields": missing_fields
+                "missing_fields": missing_fields,
+                "received_fields": list(data.keys()),
+                "received_data": data
             }), 400
 
 
         # ----------------------------------------------------
-        # Convert request to DataFrame
+        # Convert to DataFrame
         # ----------------------------------------------------
 
         applicant = pd.DataFrame([data])
@@ -200,28 +242,30 @@ def assess_credit():
         # Feature engineering
         # ----------------------------------------------------
 
-        applicant = engineer_features(applicant)
+        applicant = engineer_features(
+            applicant
+        )
 
 
         # ----------------------------------------------------
-        # Model prediction
+        # Prediction
         # ----------------------------------------------------
 
-        prediction = pipeline.predict(applicant)[0]
+        prediction = pipeline.predict(
+            applicant
+        )[0]
 
-        probabilities = pipeline.predict_proba(applicant)[0]
+        probabilities = pipeline.predict_proba(
+            applicant
+        )[0]
 
+        probability_bad = float(
+            probabilities[0]
+        )
 
-        # Your target encoding was:
-        #
-        # good = 1
-        # bad  = 0
-        #
-        # Therefore probabilities[0] = bad
-        # and probabilities[1] = good.
-
-        probability_bad = float(probabilities[0])
-        probability_good = float(probabilities[1])
+        probability_good = float(
+            probabilities[1]
+        )
 
 
         # ----------------------------------------------------
@@ -235,55 +279,45 @@ def assess_credit():
 
 
         # ----------------------------------------------------
-        # Business decision
+        # Decision
         # ----------------------------------------------------
 
         if risk_score < 30:
 
             decision = "Approved"
-
-        elif risk_score < 70:
-
-            decision = "Manual Review"
-
-        else:
-
-            decision = "Rejected"
-
-
-        # ----------------------------------------------------
-        # Risk level
-        # ----------------------------------------------------
-
-        if risk_score < 30:
-
             risk_level = "Low"
 
         elif risk_score < 70:
 
+            decision = "Manual Review"
             risk_level = "Medium"
 
         else:
 
+            decision = "Rejected"
             risk_level = "High"
 
 
         # ----------------------------------------------------
-        # SHAP explanation
+        # SHAP
         # ----------------------------------------------------
 
-        shap_explanation = get_shap_explanation(
-            applicant
+        shap_explanation = (
+            get_shap_explanation(
+                applicant
+            )
         )
 
 
         # ----------------------------------------------------
-        # Return response
+        # Response
         # ----------------------------------------------------
 
         return jsonify({
 
-            "prediction": int(prediction),
+            "prediction": int(
+                prediction
+            ),
 
             "probability_good": round(
                 probability_good,
@@ -301,7 +335,8 @@ def assess_credit():
 
             "decision": decision,
 
-            "top_risk_factors": shap_explanation
+            "top_risk_factors":
+                shap_explanation
 
         })
 
